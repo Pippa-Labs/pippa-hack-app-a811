@@ -39,3 +39,6 @@ env/
 .idea/
 .vscode/
 *.log
+.env
+.claude/settings.local.json
+.DS_Store

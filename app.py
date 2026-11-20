@@ -1,178 +1,246 @@
-"""Your app. Replace this with whatever you are building.
+"""Running Tab: where can I still get a drink near here, latest closing first.
 
-The shape never changes, whatever your app does:
+Two requests to Google Places (New), both POSTs to a fixed address:
 
-    class App:
-        manifest  -> the parsed manifest.yaml sitting next to this file
-        handle(call) -> Result
+  1. Text Search   turns the place the person named into coordinates
+                   (skipped when they gave "lat, lon").
+  2. Nearby Search finds bars, pubs and clubs within walking distance,
+                   with their opening hours.
 
-`handle` is called once per request and must return a `Result` whose `data`
-matches the `output` your manifest declares for that outcome — exactly: every
-declared field present, nothing extra, right types. The runtime checks it and
-refuses anything that does not match, which is deliberate. An app that can
-return surprise fields is an app Pippa cannot describe to a user before they
-install it.
+The opening-hours logic lives in venues.py. This file is the Pippa side:
+inputs in, errors as sentences, data in the shape manifest.yaml declares.
 
-Three things worth knowing before you start:
-
-**You get the inputs, and nothing about who asked.** No user id, no account,
-no conversation. `call.inputs` is what Pippa extracted from the message;
-besides it, `call.context` carries only the time, an id for your logs, and
-whether the person picked your app by name. This is on purpose: your app
-cannot leak what it was never given.
-
-**You keep nothing.** A fresh copy of this class is built for every call and
-thrown away afterwards. Writing to a file or a global will appear to work and
-then silently stop, because the next call may be on a different machine.
-
-**Errors are part of the design.** Raise `AgentAppError` with a `user_message`
-when you cannot answer. That message is the one a user may see; everything
-else — the exception type, the traceback — stays in the logs.
+The key: GOOGLE_MAPS_API_KEY, read from os.environ inside handle(), sent
+only to places.googleapis.com, in a header that does not follow redirects.
+Nothing from the question chooses the host, the path or the header.
 """
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+import json
+import os
+import urllib.error
+import urllib.request
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 from pippa_agentapp_sdk import (
     AgentAppError,
     Call,
     Manifest,
+    RateLimitedError,
     Result,
+    ServiceUnavailableError,
     load_manifest_file,
     validate_manifest,
 )
 
+import venues
+
 MANIFEST_PATH = Path(__file__).with_name("manifest.yaml")
 
+USER_AGENT = "pippa-agent-app-running-tab/0.1 (https://github.com/Pippa-Labs)"
 
-class CannotReadDate(AgentAppError):
-    """Raised when the message did not contain a date we can work with."""
+TEXT_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
+NEARBY_SEARCH_URL = "https://places.googleapis.com/v1/places:searchNearby"
 
-    # What a user may be shown. Write it as a sentence, not an error code.
-    user_message = "I could not work out which date you meant."
+TEXT_SEARCH_FIELDS = "places.displayName,places.formattedAddress,places.location"
+NEARBY_FIELDS = ",".join([
+    "places.id",
+    "places.displayName",
+    "places.location",
+    "places.primaryType",
+    "places.businessStatus",
+    "places.utcOffsetMinutes",
+    "places.currentOpeningHours",
+    "places.regularOpeningHours",
+])
+
+#: Great Britain and Northern Ireland, roughly. Places outside are not found.
+UK_BOUNDS = {"low": {"latitude": 49.8, "longitude": -8.7},
+             "high": {"latitude": 60.9, "longitude": 1.8}}
+
+DEFAULT_WALK_MINUTES = 10
+MAX_WALK_MINUTES = 30
+#: How many venues go back to Pippa. Google returns at most 20.
+MAX_VENUES = 8
+
+
+class KeyMissing(AgentAppError):
+    user_message = "Running Tab isn't set up yet: its builder still has to add its Google Maps key."
     retryable = False
 
 
-class App:
-    """A small, complete example: count the days until a date."""
+class GoogleRefused(AgentAppError):
+    user_message = ("Google Maps refused Running Tab's request, so its builder needs to "
+                    "check the app's Google Maps key.")
+    retryable = False
 
+
+class NoLocation(AgentAppError):
+    user_message = ("Tell me where you are (an area, a street, a station or a postcode) "
+                    "and I'll find what's open latest nearby.")
+    retryable = False
+
+
+class PlaceNotFound(AgentAppError):
+    user_message = "I could not find that place."
+    retryable = False
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect is an error: the key never goes anywhere but Google."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+class App:
     def __init__(self) -> None:
-        # Validated at construction, so an app whose manifest is wrong fails
-        # immediately and loudly rather than on some later call.
         self._manifest = validate_manifest(load_manifest_file(MANIFEST_PATH))
 
     @property
     def manifest(self) -> Manifest:
         return self._manifest
 
-    def handle(self, call: Call) -> Result:
-        """One request in, one Result out.
+    # ── The one method that touches the network ──────────────────────────────
 
-        `call.outcome_id` says which of your manifest's outcomes was asked
-        for. With one outcome you can ignore it; with several, branch on it.
+    def _post(self, url: str, body: dict, field_mask: str, key: str,
+              timeout: float = 6.0) -> bytes:
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode("utf-8"),
+            method="POST",
+            headers={
+                "User-Agent": USER_AGENT,
+                "Content-Type": "application/json",
+                "X-Goog-FieldMask": field_mask,
+            },
+        )
+        request.add_unredirected_header("X-Goog-Api-Key", key)
+        with _OPENER.open(request, timeout=timeout) as response:
+            return response.read()
+
+    def _google(self, url: str, body: dict, field_mask: str, key: str,
+                what: str, timeout: float) -> dict:
+        """POST to Google and return the JSON, with every failure a sentence.
+
+        Never passes on Google's error text or the URL: say what happened
+        from the status code alone.
         """
-        if call.outcome_id != "days.until":
+        try:
+            raw = self._post(url, body, field_mask, key, timeout)
+        except urllib.error.HTTPError as exc:       # first: it IS a URLError
+            if exc.code in (401, 403):
+                raise GoogleRefused(f"{what}: google answered {exc.code}")
+            if exc.code == 429:
+                raise RateLimitedError(f"{what}: google answered 429")
+            raise ServiceUnavailableError(f"{what}: google answered {exc.code}")
+        except TimeoutError:                        # NOT a URLError
+            raise ServiceUnavailableError(f"{what}: google did not answer in time")
+        except urllib.error.URLError as exc:
+            raise ServiceUnavailableError(f"{what}: could not reach google ({exc.reason})")
+        try:
+            payload = json.loads(raw or b"{}")
+        except ValueError:
+            raise ServiceUnavailableError(f"{what}: google sent something that is not JSON")
+        return payload if isinstance(payload, dict) else {}
+
+    # ── The outcome ──────────────────────────────────────────────────────────
+
+    def handle(self, call: Call) -> Result:
+        if call.outcome_id != "venues.latest":
             raise AgentAppError(f"this app cannot do {call.outcome_id!r}")
 
-        text = (call.inputs.get("date") or "").strip()
-        if not text:
-            # The manifest tells the extractor to send an empty string rather
-            # than guess, so this is the ordinary "they did not say" path.
-            #
-            # A missing or unreadable date (here, and in `_parse` below) is
-            # the only thing this app refuses for, which is why it never reads
-            # `call.context.explicit`, True when the person picked the app
-            # with @. That refusal is right whoever chose the app; the test
-            # that says so is in test_app.py.
-            raise CannotReadDate("no date in the message")
+        location = " ".join((call.inputs.get("location") or "").split())
+        if not location:
+            raise NoLocation("no location in the message")
 
-        # `call.context.now` is the current time, supplied by the runtime
-        # rather than read from the clock. That is what makes an app testable:
-        # a test can say what "now" is.
-        today = self._today(call)
-        target = self._parse(text, today)
-        difference = (target - today).days
+        key = os.environ.get("GOOGLE_MAPS_API_KEY", "")
+        if not key:
+            raise KeyMissing("GOOGLE_MAPS_API_KEY is not set: .env locally, Keys in Pippa")
 
-        return Result(
-            data={
-                "days": abs(difference),
-                "target_date": target.isoformat(),
-                "weekday": target.strftime("%A"),
-                "already_passed": difference < 0,
+        walk = call.inputs.get("walk_minutes")
+        if not isinstance(walk, int) or walk <= 0:
+            walk = DEFAULT_WALK_MINUTES
+        walk = min(walk, MAX_WALK_MINUTES)
+        radius = walk * venues.METRES_PER_WALK_MINUTE
+
+        lat, lon, location_used = self._locate(location, key)
+
+        found = self._google(
+            NEARBY_SEARCH_URL,
+            {
+                "includedPrimaryTypes": list(venues.VENUE_TYPES),
+                "maxResultCount": 20,
+                "rankPreference": "DISTANCE",
+                "locationRestriction": {
+                    "circle": {"center": {"latitude": lat, "longitude": lon},
+                               "radius": float(radius)},
+                },
             },
-            # Optional. One plain sentence Pippa may use when it writes its
-            # reply. Say what you found, not what you did.
-            narrative=self._sentence(target, difference),
+            NEARBY_FIELDS, key, "nearby search", timeout=7.0,
         )
+        places = found.get("places") or []
 
-    @staticmethod
-    def _today(call: Call) -> date:
-        """The user's today, not the server's.
+        now = call.context.now
+        ranked = venues.rank(places, now, (lat, lon))
+        top = ranked["open"][:MAX_VENUES]
 
-        A server in UTC and a user in Auckland disagree about what day it is
-        for twelve hours out of every twenty-four, and "how many days until"
-        is exactly the question that notices.
-        """
-        # No try/except around ZoneInfo, and that is the point: the manifest
-        # declares this input as `type: timezone`, so the runtime has already
-        # rejected anything that is not a real IANA zone before your code
-        # runs. Declaring the right type is cheaper than validating by hand,
-        # and the user gets a better error.
-        zone = call.inputs.get("timezone")
-        moment: datetime = call.context.now
-        if zone:
-            moment = moment.astimezone(ZoneInfo(zone))
-        return moment.date()
+        data = {
+            "location_used": location_used,
+            "search_radius_m": radius,
+            "venues": [venues.describe(v, now) for v in top],
+            "open_count": len(ranked["open"]),
+            "closed_count": ranked["closed"],
+            "unknown_hours": ranked["unknown"][:MAX_VENUES],
+        }
+        if top:
+            data["latest_venue"] = top[0]["name"]
+            data["latest_closing"] = venues.close_label(
+                top[0]["status"], top[0]["closes_at"], now)
+            if top[0]["closes_at"] is not None:
+                # Aware (venue's own zone), so it carries a UTC offset.
+                data["latest_closes_at"] = top[0]["closes_at"].isoformat()
 
-    @staticmethod
-    def _parse(text: str, today: date) -> date:
-        """Turn what the user wrote into a date.
+        return Result(data=data, narrative=self._sentence(top, location_used, walk, now))
 
-        Deliberately small — real date parsing is its own project. Handles
-        `YYYY-MM-DD`, `25 December`, `December 25` and a bare day number.
-        """
-        cleaned = text.replace(",", " ").strip()
+    def _locate(self, location: str, key: str) -> tuple[float, float, str]:
+        """Coordinates for what the person typed, and the name we used."""
+        coords = venues.parse_latlon(location)
+        if coords:
+            return coords[0], coords[1], location
 
-        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
-            try:
-                return datetime.strptime(cleaned, fmt).date()
-            except ValueError:
-                continue
-
-        for fmt in ("%d %B", "%B %d", "%d %b", "%b %d"):
-            try:
-                parsed = datetime.strptime(cleaned, fmt).date()
-            except ValueError:
-                continue
-            # A bare day and month has no year. "25 December" asked in
-            # February means this year; asked in December means this year too,
-            # until it has passed, and then it means next year.
-            candidate = parsed.replace(year=today.year)
-            if candidate < today:
-                candidate = candidate.replace(year=today.year + 1)
-            return candidate
-
-        if cleaned.lower() == "tomorrow":
-            return today + timedelta(days=1)
-
-        raise CannotReadDate(f"could not parse {text!r} as a date")
-
-    @staticmethod
-    def _sentence(target: date, difference: int) -> str:
-        # Built by hand rather than with `%-d`, which is a GNU extension: it
-        # raises ValueError on Windows, where half of you are developing, and
-        # the failure would only show up at the last line of a working app.
-        pretty = (
-            f"{target.strftime('%A')} {target.day} "
-            f"{target.strftime('%B')} {target.year}"
+        found = self._google(
+            TEXT_SEARCH_URL,
+            {"textQuery": location, "regionCode": "GB", "maxResultCount": 1,
+             # UK only: Google's text search is generous enough to turn
+             # nonsense into a bar in Bangkok, and step 2's routes are TfL.
+             "locationRestriction": {"rectangle": UK_BOUNDS}},
+            TEXT_SEARCH_FIELDS, key, "text search", timeout=5.0,
         )
-        if difference == 0:
-            return f"That is today, {pretty}."
-        if difference < 0:
-            return f"{pretty} was {abs(difference)} days ago."
-        if difference == 1:
-            return f"{pretty} is tomorrow."
-        return f"There are {difference} days until {pretty}."
+        places = found.get("places") or []      # 200 with {} for no match
+        point = (places[0].get("location") or {}) if places else {}
+        if "latitude" not in point or "longitude" not in point:
+            error = PlaceNotFound(f"text search found nothing for {location!r}")
+            error.user_message = f"I could not find anywhere in the UK called {location}."
+            raise error
+        name = (places[0].get("formattedAddress")
+                or venues.place_name(places[0]) or location)
+        return point["latitude"], point["longitude"], name
+
+    @staticmethod
+    def _sentence(top: list, location_used: str, walk: int, now) -> str:
+        if not top:
+            return (f"Nothing within about {walk} minutes' walk of {location_used} "
+                    f"is open right now, as far as Google's opening hours say.")
+        first = top[0]
+        lead = (f"Open latest near {location_used}: {first['name']}, "
+                f"{venues.close_label(first['status'], first['closes_at'], now)}")
+        rest = [f"{v['name']} {venues.close_label(v['status'], v['closes_at'], now)}"
+                for v in top[1:3]]
+        if rest:
+            return lead + ". Then " + "; ".join(rest) + "."
+        return lead + "."
