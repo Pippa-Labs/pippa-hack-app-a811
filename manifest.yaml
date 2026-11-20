@@ -14,27 +14,30 @@ app:
   id: hack.app_a811
   name: Running Tab
   # Bump this before pushing again once a version is submitted for review.
-  version: 0.1.0
+  version: 0.2.0
   # Never use the word "b-y" here: the badge is split on it.
   summary: >-
     Finds pubs, bars and clubs still open near a UK place, latest closing
-    first, including places that close after midnight. Sends the place name to
-    Google Maps to look up venues and opening hours.
+    first (past midnight included), and how you'd get home on TfL after each
+    one closes. Sends place names to Google Maps and journeys to TfL.
 
 agent_types:
   - personal
 
 outcomes:
   - id: venues.latest
-    summary: Pubs and bars open near a place, ranked from latest closing time
+    summary: >-
+      Pubs and bars open near a place, latest closing first, with the journey
+      home from each at closing time
     example_phrases:
       - where can i still get a drink near
       - which pubs are open late near
+      - late drink and how do i get home after
       - what bars are still open around
       - which bar near here closes latest
       - pubs open after midnight near
-      - where is open latest for a drink
-      - late night bars near
+      - where can i drink late and get home to
+      - last orders near and the night bus home
       - is anywhere still serving drinks near
     inputs:
       - name: location
@@ -53,6 +56,15 @@ outcomes:
           How many minutes the person is willing to walk, only if they said so
           (for example "within 5 minutes' walk" is 5). Leave this out entirely
           if they did not mention it. Never guess a value.
+      - name: destination
+        type: string
+        required: false
+        description: >-
+          Where the person wants to get home to afterwards, only if the message
+          names it: a postcode, area, station or address (for example "N1 9GU",
+          "King's Cross", "Brixton"). If they only say "home" without naming a
+          place, or do not mention getting home, return an empty string rather
+          than guessing.
     output:
       - name: location_used
         type: string
@@ -88,8 +100,44 @@ outcomes:
         type: datetime
         required: false
         description: When that venue closes, with its UTC offset. Absent if open 24 hours.
+      - name: destination_used
+        type: string
+        required: false
+        description: The destination routes were planned to, as Google Maps named it.
+      - name: routes_home
+        type: array
+        item_type: string
+        required: false
+        description: >-
+          For the top five venues, in the same order as venues: when to leave
+          (closing time, or now if open 24 hours), when you'd get home, the
+          journey time and the legs, from TfL's journey planner.
+      - name: route_disruptions
+        type: array
+        item_type: string
+        required: false
+        description: Current TfL problems on the lines those routes use.
+      - name: latest_venue_home_at
+        type: datetime
+        required: false
+        description: When you'd get home leaving the latest-open venue at its closing time.
+      - name: latest_venue_journey_min
+        type: integer
+        required: false
+        description: How many minutes that journey home takes.
+      - name: latest_venue_route
+        type: string
+        required: false
+        description: That journey's legs, e.g. "walk 4 min > 14 bus > Victoria line > walk 15 min".
+      - name: route_note
+        type: string
+        required: false
+        description: Why there are no routes home, when a destination was given but none could be planned.
 
 app_secrets:
   - name: GOOGLE_MAPS_API_KEY
     description: "Google Maps Platform key with the Places API (New), used to find venues and opening hours"
     required: true
+  - name: TFL_APP_KEY
+    description: "TfL Unified API app key, used for journeys home; TfL also answers without one, at a lower rate limit"
+    required: false

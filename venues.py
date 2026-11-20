@@ -265,7 +265,8 @@ def rank(places: list, now: datetime, centre: tuple[float, float]) -> dict:
     """Sort the open places by how late they stay open, latest first.
 
     Returns {"open": [entries...], "unknown": [names...], "closed": count},
-    where each entry is a dict with name, kind, distance_m, status, closes_at.
+    where each entry is a dict with name, kind, distance_m, point (lat, lon),
+    status, closes_at.
     Places that have shut for good, or for now, are dropped altogether.
     """
     open_places, unknown, closed = [], [], 0
@@ -286,13 +287,15 @@ def rank(places: list, now: datetime, centre: tuple[float, float]) -> dict:
             closed += 1
             continue
         loc = place.get("location") or {}
-        metres = None
+        metres, point = None, None
         if "latitude" in loc and "longitude" in loc:
-            metres = distance_m(centre[0], centre[1], loc["latitude"], loc["longitude"])
+            point = (loc["latitude"], loc["longitude"])
+            metres = distance_m(centre[0], centre[1], point[0], point[1])
         open_places.append({
             "name": name,
             "kind": kind,
             "distance_m": metres,
+            "point": point,
             "status": status,
             "closes_at": close,
         })

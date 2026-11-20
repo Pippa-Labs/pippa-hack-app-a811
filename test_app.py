@@ -1,8 +1,9 @@
 """Tests for Running Tab, run through LocalRunner so the manifest is enforced.
 
 The network is blocked (conftest.py). Google is replaced by stubbing
-`App._post`, the one method that does HTTP. The payloads below have the same
-shape as real Places API (New) responses captured on 20 Nov 2026.
+`App._post` and TfL by stubbing `App._get`, the two methods that do HTTP.
+The payloads below have the same shape as real Places API (New) and TfL
+Journey Planner responses captured on 20 Nov 2026.
 """
 
 from __future__ import annotations
@@ -10,10 +11,12 @@ from __future__ import annotations
 import json
 import urllib.error
 from datetime import datetime, timezone
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from pippa_agentapp_sdk import LocalRunner, RateLimitedError, ServiceUnavailableError
 
+import routes
 import venues
 from app import (
     NEARBY_SEARCH_URL,
@@ -26,6 +29,7 @@ from app import (
 )
 
 FAKE_KEY = "test-key-not-real-000000000000"  # pragma: allowlist secret
+FAKE_TFL_KEY = "tfl-test-key-not-real-00000"  # pragma: allowlist secret
 
 # Friday 20 November 2026, 23:00 in London (GMT, so UTC+0).
 FRI_2300 = datetime(2026, 11, 20, 23, 0, tzinfo=timezone.utc)
@@ -33,6 +37,7 @@ SAT_0130 = datetime(2026, 11, 21, 1, 30, tzinfo=timezone.utc)
 SUN_0100 = datetime(2026, 11, 22, 1, 0, tzinfo=timezone.utc)
 
 CENTRE = {"latitude": 51.4941, "longitude": -0.1738}
+HOME = {"latitude": 51.5361, "longitude": -0.1225}     # N1 9GU
 
 
 def weekly(*spans):
@@ -72,12 +77,15 @@ NO_HOURS = place("Teahouse", None, kind="cocktail_bar")
 class FakeGoogle:
     """Stands in for App._post and records what it was asked."""
 
-    def __init__(self, nearby=None, text=None, error=None):
+    def __init__(self, nearby=None, text=None, error=None, dest=None):
         self.nearby = {"places": nearby or []}
         self.text = text if text is not None else {
             "places": [{"displayName": {"text": "South Kensington"},
                         "formattedAddress": "South Kensington, London",
                         "location": CENTRE}]}
+        #: What a text search for the destination returns ("N1 9GU").
+        self.dest = dest if dest is not None else {
+            "places": [{"formattedAddress": "90 York Wy, London N1 9GU", "location": HOME}]}
         self.error = error
         self.calls = []
 
@@ -85,18 +93,75 @@ class FakeGoogle:
         self.calls.append({"url": url, "body": body, "key": key})
         if self.error is not None:
             raise self.error
-        payload = self.text if url == TEXT_SEARCH_URL else self.nearby
+        if url == TEXT_SEARCH_URL:
+            payload = self.dest if body["textQuery"] == "N1 9GU" else self.text
+        else:
+            payload = self.nearby
         return json.dumps(payload).encode("utf-8")
+
+
+def tfl_journey(start, arrive, legs):
+    """One TfL journey; times are naive London wall-clock, as TfL sends them."""
+    s, a = datetime.fromisoformat(start), datetime.fromisoformat(arrive)
+    return {"startDateTime": start, "arrivalDateTime": arrive,
+            "duration": int((a - s).total_seconds() // 60), "legs": legs}
+
+
+def leg(mode, minutes, name=""):
+    return {"mode": {"id": mode}, "duration": minutes,
+            "instruction": {"summary": f"{name} {mode}"},
+            "routeOptions": [{"name": name}]}
+
+
+#: Shaped on the live 03:00 South Kensington -> N1 9GU answer.
+NIGHT_ROUTE = {
+    "journeys": [
+        # 43 min, but leaves later and gets home later: not the one to pick.
+        tfl_journey("2026-11-21T03:29:00", "2026-11-21T04:12:00",
+                    [leg("walking", 4), leg("bus", 24, "14"), leg("bus", 9, "N91"),
+                     leg("walking", 3)]),
+        tfl_journey("2026-11-21T03:09:00", "2026-11-21T03:59:00",
+                    [leg("walking", 0), leg("walking", 4), leg("bus", 8, "14"),
+                     leg("tube", 7, "Victoria"), leg("walking", 15)]),
+    ],
+    "lines": [
+        {"id": "14", "name": "14", "lineStatuses": [{"statusSeverityDescription": "Good Service"}]},
+        {"id": "victoria", "name": "Victoria", "lineStatuses": [{
+            "statusSeverityDescription": "Severe Delays",
+            "reason": "Victoria Line: Severe delays due to an earlier faulty train."}]},
+        {"id": "n91", "name": "N91", "lineStatuses": [{
+            "statusSeverityDescription": "Special Service",
+            "reason": "SOUTHAMPTON ROW: on diversion."}]},
+    ],
+}
+
+
+class FakeTfl:
+    """Stands in for App._get. `answer` is a payload, an exception, or a
+    function of the parsed query returning either."""
+
+    def __init__(self, answer=None):
+        self.answer = NIGHT_ROUTE if answer is None else answer
+        self.urls = []
+
+    def __call__(self, url, timeout=6.0):
+        self.urls.append(url)
+        answer = self.answer(parse_qs(urlsplit(url).query)) if callable(self.answer) else self.answer
+        if isinstance(answer, BaseException):
+            raise answer
+        return json.dumps(answer).encode("utf-8")
 
 
 @pytest.fixture(autouse=True)
 def key(monkeypatch):
     monkeypatch.setenv("GOOGLE_MAPS_API_KEY", FAKE_KEY)
+    monkeypatch.setenv("TFL_APP_KEY", FAKE_TFL_KEY)
 
 
-def run(google, inputs=None, now=FRI_2300, explicit=False):
+def run(google, inputs=None, now=FRI_2300, explicit=False, tfl=None):
     app = App()
     app._post = google
+    app._get = tfl if tfl is not None else FakeTfl()
     if inputs is None:
         inputs = {"location": "South Kensington"}
     return LocalRunner(app).call(
@@ -342,3 +407,135 @@ def test_errors_never_carry_the_key():
         run(FakeGoogle(error=_http(403)))
     assert FAKE_KEY not in str(failure.value)
     assert FAKE_KEY not in failure.value.user_message
+
+
+# ── Routes home (step 2) ─────────────────────────────────────────────────────
+
+HOME_TRIP = {"location": "South Kensington", "destination": "N1 9GU"}
+
+
+def test_no_destination_means_no_tfl_and_no_route_fields():
+    tfl = FakeTfl()
+    data = run(FakeGoogle([CLUB_3AM]), tfl=tfl).data
+    assert tfl.urls == []
+    for field in ("routes_home", "route_disruptions", "destination_used",
+                  "latest_venue_home_at", "route_note"):
+        assert field not in data
+
+
+def test_the_route_home_leaves_at_closing_time():
+    tfl = FakeTfl()
+    data = run(FakeGoogle([CLUB_3AM]), HOME_TRIP, tfl=tfl).data
+    query = parse_qs(urlsplit(tfl.urls[0]).query)
+    assert query["date"] == ["20261121"] and query["time"] == ["0300"]
+    assert query["timeIs"] == ["Departing"]
+    assert data["destination_used"] == "90 York Wy, London N1 9GU"
+    assert data["routes_home"] == [
+        "Luna Kensington: leave at 3am, home 3:59am (50 min from 3:09am): "
+        "walk 4 min > 14 bus > Victoria line > walk 15 min"]
+
+
+def test_earliest_arrival_wins_over_shortest_trip():
+    data = run(FakeGoogle([CLUB_3AM]), HOME_TRIP).data
+    assert data["latest_venue_home_at"] == "2026-11-21T03:59:00+00:00"
+    assert data["latest_venue_journey_min"] == 50
+    assert data["latest_venue_route"] == "walk 4 min > 14 bus > Victoria line > walk 15 min"
+
+
+def test_disruptions_are_only_for_lines_used_and_not_good_service():
+    data = run(FakeGoogle([CLUB_3AM]), HOME_TRIP).data
+    # N91 is only on the journey not chosen; the 14 has a good service.
+    assert data["route_disruptions"] == [
+        "Victoria: Severe Delays (Severe delays due to an earlier faulty train.)"]
+
+
+def test_only_the_top_five_get_routes():
+    six = [place(f"Pub {n}", every_day("09:00", "00:00", overnight=True)) for n in range(6)]
+    tfl = FakeTfl()
+    data = run(FakeGoogle(six), HOME_TRIP, tfl=tfl).data
+    assert len(data["venues"]) == 6
+    assert len(tfl.urls) == 5
+    assert len(data["routes_home"]) == 5
+
+
+def test_a_24_hour_venue_routes_from_now():
+    allday = place("Glamis Bar", {"periods": [{"open": {"day": 0, "hour": 0, "minute": 0}}]},
+                   kind="bar")
+    tfl = FakeTfl()
+    data = run(FakeGoogle([allday]), HOME_TRIP, tfl=tfl).data
+    assert parse_qs(urlsplit(tfl.urls[0]).query)["time"] == ["2300"]
+    assert data["routes_home"][0].startswith("Glamis Bar: leave now, home 3:59am")
+
+
+def test_tfl_times_get_the_summer_offset():
+    july = datetime(2026, 7, 17, 22, 0, tzinfo=timezone.utc)     # 23:00 BST
+    summer = {"journeys": [tfl_journey("2026-07-18T03:05:00", "2026-07-18T03:50:00",
+                                       [leg("bus", 45, "N19")])], "lines": []}
+    data = run(FakeGoogle([dict(CLUB_3AM, utcOffsetMinutes=60)]), HOME_TRIP,
+               now=july, tfl=FakeTfl(summer)).data
+    assert data["latest_venue_home_at"] == "2026-07-18T03:50:00+01:00"
+
+
+def test_the_tfl_request_goes_to_tfl_with_the_key_in_the_query():
+    tfl = FakeTfl()
+    run(FakeGoogle([CLUB_3AM]), HOME_TRIP, tfl=tfl)
+    parts = urlsplit(tfl.urls[0])
+    assert (parts.scheme, parts.netloc) == ("https", "api.tfl.gov.uk")
+    assert parts.path.startswith("/Journey/JourneyResults/")
+    assert parse_qs(parts.query)["app_key"] == [FAKE_TFL_KEY]
+
+
+def test_without_a_tfl_key_it_still_asks_tfl(monkeypatch):
+    monkeypatch.delenv("TFL_APP_KEY", raising=False)
+    tfl = FakeTfl()
+    data = run(FakeGoogle([CLUB_3AM]), HOME_TRIP, tfl=tfl).data
+    assert "app_key" not in parse_qs(urlsplit(tfl.urls[0]).query)
+    assert len(data["routes_home"]) == 1
+
+
+def test_a_destination_google_cannot_find_still_returns_the_venues():
+    data = run(FakeGoogle([CLUB_3AM], dest={}), HOME_TRIP).data
+    assert data["venues"]
+    assert data["route_note"] == "I could not find N1 9GU in the UK, so there are no routes home."
+    assert "routes_home" not in data
+
+
+def test_no_journeys_anywhere_says_tfl_is_london_only():
+    data = run(FakeGoogle([CLUB_3AM]), HOME_TRIP, tfl=FakeTfl({"journeys": []})).data
+    assert data["routes_home"] == ["Luna Kensington: no route found at that time"]
+    assert "in and around London only" in data["route_note"]
+
+
+@pytest.mark.parametrize("error, words", [
+    (urllib.error.HTTPError("https://api.tfl.gov.uk/x", 404, "nf", {}, None), "no route found"),
+    (urllib.error.HTTPError("https://api.tfl.gov.uk/x", 429, "busy", {}, None), "TfL is busy"),
+    (urllib.error.HTTPError("https://api.tfl.gov.uk/x", 500, "err", {}, None), "not answering"),
+    (TimeoutError("read timed out"), "did not answer in time"),
+    (urllib.error.URLError("dns"), "could not be reached"),
+])
+def test_a_tfl_failure_never_sinks_the_answer(error, words):
+    data = run(FakeGoogle([CLUB_3AM]), HOME_TRIP, tfl=FakeTfl(error)).data
+    assert data["venues"]
+    assert words in data["routes_home"][0]
+    assert FAKE_TFL_KEY not in json.dumps(data)
+
+
+def test_one_failed_route_does_not_spoil_the_others():
+    def answer(query):
+        return {"journeys": []} if query["time"] == ["0000"] else NIGHT_ROUTE
+    data = run(FakeGoogle([PUB_MIDNIGHT, CLUB_3AM]), HOME_TRIP, tfl=FakeTfl(answer)).data
+    assert data["routes_home"][0].startswith("Luna Kensington: leave at 3am")
+    assert data["routes_home"][1] == "Zetland Arms: no route found at that time"
+    assert "route_note" not in data
+
+
+def test_the_narrative_mentions_getting_home():
+    result = run(FakeGoogle([CLUB_3AM]), HOME_TRIP)
+    assert "leaving at 3am, you'd reach 90 York Wy, London N1 9GU at 3:59am" in result.narrative
+
+
+def test_leg_wording():
+    assert routes._leg_words(leg("tube", 7, "Victoria")) == "Victoria line"
+    assert routes._leg_words(leg("bus", 8, "N205")) == "N205 bus"
+    assert routes._leg_words(leg("elizabeth-line", 9, "Elizabeth line")) == "Elizabeth line"
+    assert routes._leg_words(leg("walking", 0)) == ""
