@@ -14,12 +14,12 @@ app:
   id: hack.app_a811
   name: Running Tab
   # Bump this before pushing again once a version is submitted for review.
-  version: 0.3.0
+  version: 0.4.0
   # Never use the word "b-y" here: the badge is split on it.
   summary: >-
     Finds pubs, bars and clubs still open near a UK place, latest closing
-    first (past midnight included), and how you'd get home on TfL after each
-    one closes. Sends place names to Google Maps and journeys to TfL.
+    first (past midnight included), which ones look likely cheap, and how
+    you'd get home on TfL after each one closes. Sends place names to Google Maps and journeys to TfL.
 
 agent_types:
   - personal
@@ -40,6 +40,7 @@ outcomes:
       - last orders near and the night bus home
       - is anywhere still serving drinks near
       - which pubs are open till 2am near
+      - cheap pubs still open near
     inputs:
       - name: location
         type: string
@@ -75,6 +76,14 @@ outcomes:
           "2am", "until half one" is "1:30am", "past midnight" is "midnight").
           If they did not name a time, or only said "late", return an empty
           string rather than guessing.
+      - name: cheap_only
+        type: boolean
+        required: false
+        description: >-
+          True only if the person asked for cheap, budget or inexpensive
+          places (for example "cheap pubs", "a Spoons", "somewhere not
+          pricey"). Leave this out entirely if they did not mention price.
+          Never guess.
     output:
       - name: location_used
         type: string
@@ -87,8 +96,10 @@ outcomes:
         item_type: string
         description: >-
           Venues open now, latest closing first and open-24-hours places last,
-          each as "name (kind, distance, walking time): open till <time>". If
-          open_until was given, only those open at least that late.
+          each as "name (kind, distance, walking time): open till <time>",
+          with ", likely cheap" (and the chain, e.g. "(Wetherspoon)") on those
+          that look cheap. Only those open at least till open_until if given,
+          and only the likely cheap ones if cheap_only.
       - name: open_count
         type: integer
         description: How many venues in range are open now.
@@ -99,6 +110,16 @@ outcomes:
         type: array
         item_type: string
         description: Venues in range whose opening hours Google does not have.
+      - name: likely_cheap_count
+        type: integer
+        description: >-
+          How many of the venues open now (and till open_until, if given) are
+          likely cheap: a Wetherspoon, Samuel Smith's or Simmons, or rated
+          inexpensive on Google. A guess from the chain or rating, never a price.
+      - name: likely_cheap_venues
+        type: array
+        item_type: string
+        description: The names of those likely cheap venues, latest closing first.
       - name: latest_venue
         type: string
         required: false

@@ -662,3 +662,91 @@ def test_an_unreadable_time_says_what_to_type():
 def test_no_open_until_means_no_filter_fields():
     data = run(FakeGoogle([CLUB_3AM])).data
     assert "open_until_used" not in data and "closing_too_early" not in data
+
+
+# ── Likely cheap ─────────────────────────────────────────────────────────────
+
+LATE = every_day("12:00", "02:00", overnight=True)
+SPOONS = place("The Moon Under Water", LATE, priceLevel="PRICE_LEVEL_MODERATE",
+               websiteUri="https://www.jdwetherspoon.com/pubs/all-pubs/england/london/"
+                          "the-moon-under-water-west-end?utm_source=google")
+SAMS = place("Horse & Groom", LATE, websiteUri="http://www.samuelsmithsbrewery.co.uk/site/pubs/")
+SIMMONS = place("Simmons Bar | Soho", LATE, kind="cocktail_bar",
+                websiteUri="https://www.simmonsbar.co.uk/venues/soho/")
+RATED = place("Cheap Local", LATE, priceLevel="PRICE_LEVEL_INEXPENSIVE")
+PRICEY = place("Fancy Bar", LATE, kind="bar", priceLevel="PRICE_LEVEL_EXPENSIVE",
+               websiteUri="https://example.com/?ref=jdwetherspoon.com")
+
+
+@pytest.mark.parametrize("website, chain", [
+    ("https://www.jdwetherspoon.com/pubs/walham-green-fulham", "Wetherspoon"),
+    ("http://www.jdwetherspoon.co.uk/home/pubs/the-willow-walk", "Wetherspoon"),
+    ("http://www.samuelsmithsbrewery.co.uk/site/pubs/", "Samuel Smith's"),
+    ("https://www.simmonsbar.co.uk/venues/clapham/", "Simmons"),
+    ("https://example.com/?ref=jdwetherspoon.com", None),       # host, not anywhere
+    ("https://notjdwetherspoon.com/", None),
+    ("https://jdwetherspoon.com.example/", None),
+    ("", None), (None, None), ("not a url", None),
+])
+def test_cheap_chains_go_by_the_website_host(website, chain):
+    assert venues.cheap_chain(website) == chain
+
+
+def test_each_venue_line_says_likely_cheap_never_a_price():
+    data = run(FakeGoogle([SPOONS, SAMS, SIMMONS, RATED, PRICEY])).data
+    lines = {line.split(" (")[0]: line for line in data["venues"]}
+    assert lines["The Moon Under Water"].endswith("open till 2am, likely cheap (Wetherspoon)")
+    assert lines["Horse & Groom"].endswith("open till 2am, likely cheap (Samuel Smith's)")
+    assert lines["Simmons Bar | Soho"].endswith("open till 2am, likely cheap (Simmons)")
+    assert lines["Cheap Local"].endswith("open till 2am, likely cheap")
+    assert lines["Fancy Bar"].endswith("open till 2am")
+    assert not any("£" in line for line in data["venues"])
+    assert data["likely_cheap_count"] == 4
+    assert "Fancy Bar" not in data["likely_cheap_venues"]
+
+
+def test_the_narrative_counts_the_likely_cheap_ones():
+    result = run(FakeGoogle([SPOONS, PRICEY, CLUB_3AM]))
+    assert result.narrative.endswith(" 1 of the 3 look likely cheap.")
+    assert run(FakeGoogle([PRICEY])).narrative.endswith(" None of them look likely cheap.")
+
+
+def test_cheap_only_keeps_the_likely_cheap_ones():
+    tfl = FakeTfl()
+    data = run(FakeGoogle([CLUB_3AM, PRICEY, SPOONS, RATED]),
+               dict(HOME_TRIP, cheap_only=True), tfl=tfl).data
+    names = [line.split(" (")[0] for line in data["venues"]]
+    assert names == ["The Moon Under Water", "Cheap Local"]
+    assert data["latest_venue"] == "The Moon Under Water"
+    assert len(tfl.urls) == 2
+    assert data["open_count"] == 4
+
+
+def test_cheap_only_with_nothing_cheap_says_so_and_names_the_latest():
+    result = run(FakeGoogle([CLUB_3AM, PRICEY]), {"location": "Soho", "cheap_only": True})
+    assert result.data["venues"] == []
+    assert result.data["likely_cheap_count"] == 0
+    assert "looks likely cheap" in result.narrative
+    assert "The latest open is Luna Kensington, open till 3am." in result.narrative
+
+
+def test_cheap_only_false_or_missing_filters_nothing():
+    for inputs in ({"location": "Soho"}, {"location": "Soho", "cheap_only": False}):
+        assert len(run(FakeGoogle([SPOONS, PRICEY]), inputs).data["venues"]) == 2
+
+
+def test_cheap_counts_respect_open_until():
+    data = run(FakeGoogle([SPOONS, PUB_MIDNIGHT]),
+               {"location": "Soho", "open_until": "1am"}).data
+    assert data["likely_cheap_count"] == 1
+
+
+def test_the_nearby_search_asks_for_website_and_price_level():
+    google = FakeGoogle([SPOONS])
+    app = App()
+    app._post, app._get = google, FakeTfl()
+    seen = []
+    app._post = lambda url, body, mask, key, timeout=6.0: (seen.append(mask), google(url, body, mask, key, timeout))[1]
+    LocalRunner(app).call("venues.latest", {"location": "Soho"}, granted_secrets={},
+                          now=FRI_2300, request_id="t1")
+    assert "places.websiteUri" in seen[-1] and "places.priceLevel" in seen[-1]

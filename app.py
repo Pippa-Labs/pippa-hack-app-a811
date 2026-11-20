@@ -65,6 +65,8 @@ NEARBY_FIELDS = ",".join([
     "places.utcOffsetMinutes",
     "places.currentOpeningHours",
     "places.regularOpeningHours",
+    "places.websiteUri",       # for the cheap chains (venues.CHEAP_CHAINS)
+    "places.priceLevel",
 ])
 
 #: Great Britain and Northern Ireland, roughly. Places outside are not found.
@@ -231,7 +233,10 @@ class App:
         if until_clock is not None:
             until = venues.tonight_at(until_clock, now)
             late_enough = venues.open_until(ranked["open"], until)
-        top = late_enough[:MAX_VENUES]
+        cheap_only = call.inputs.get("cheap_only") is True
+        shown = [v for v in late_enough if v["likely_cheap"]] if cheap_only else late_enough
+        top = shown[:MAX_VENUES]
+        cheap_names = [v["name"] for v in late_enough if v["likely_cheap"]]
 
         data = {
             "location_used": location_used,
@@ -240,6 +245,8 @@ class App:
             "open_count": len(ranked["open"]),
             "closed_count": ranked["closed"],
             "unknown_hours": ranked["unknown"][:MAX_VENUES],
+            "likely_cheap_count": len(cheap_names),
+            "likely_cheap_venues": cheap_names[:MAX_VENUES],
         }
         if until is not None:
             data["open_until_used"] = f"{venues.clock_label(until)} {until.strftime('%A')}"
@@ -256,11 +263,14 @@ class App:
         if destination:
             first_route = self._routes_home(top, destination, key, now, started, data)
 
-        if until is not None and not top:
-            return Result(data=data, narrative=self._too_early(
-                ranked["open"], location_used, walk, until, now))
-        return Result(data=data, narrative=self._sentence(
-            top, location_used, walk, now, first_route, data.get("destination_used")))
+        if not top and ranked["open"] and (until is not None or cheap_only):
+            return Result(data=data, narrative=self._none_qualify(
+                late_enough, ranked["open"], location_used, walk, until, cheap_only, now))
+        text = self._sentence(top, location_used, walk, now, first_route,
+                              data.get("destination_used"))
+        if top and not cheap_only:
+            text += self._cheap_sentence(len(cheap_names), len(late_enough))
+        return Result(data=data, narrative=text)
 
     # ── Where ────────────────────────────────────────────────────────────────
 
@@ -391,15 +401,27 @@ class App:
     # ── The sentence ─────────────────────────────────────────────────────────
 
     @staticmethod
-    def _too_early(open_now: list, location_used: str, walk: int, until: datetime,
-                   now: datetime) -> str:
-        """Nothing stays open till the time asked for: say so, and what is latest."""
-        text = (f"Nothing within about {walk} minutes' walk of {location_used} stays open "
-                f"till {venues.clock_label(until)}, as far as Google's opening hours say.")
-        if open_now:
-            latest = open_now[0]
-            text += (f" The latest is {latest['name']}, "
-                     f"{venues.close_label(latest['status'], latest['closes_at'], now)}.")
+    def _cheap_sentence(cheap: int, total: int) -> str:
+        if cheap == 0:
+            return " None of them look likely cheap."
+        if cheap == total:
+            return " All of them look likely cheap." if total > 1 else " It looks likely cheap."
+        return f" {cheap} of the {total} look likely cheap."
+
+    @staticmethod
+    def _none_qualify(late_enough: list, open_now: list, location_used: str, walk: int,
+                      until: datetime | None, cheap_only: bool, now: datetime) -> str:
+        """Places are open, but none pass the filters: say so, and what there is."""
+        wanted = []
+        if until is not None:
+            wanted.append(f"stays open till {venues.clock_label(until)}")
+        if cheap_only:
+            wanted.append("looks likely cheap")
+        text = (f"Nothing open within about {walk} minutes' walk of {location_used} "
+                f"{' and '.join(wanted)}, as far as Google says.")
+        best = (late_enough or open_now)[0]
+        text += (f" The latest {'open ' if late_enough else ''}is {best['name']}, "
+                 f"{venues.close_label(best['status'], best['closes_at'], now)}.")
         return text
 
     @staticmethod

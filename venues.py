@@ -15,6 +15,7 @@ from __future__ import annotations
 import math
 import re
 from datetime import date, datetime, time, timedelta, timezone, tzinfo
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 LONDON = ZoneInfo("Europe/London")
@@ -38,6 +39,23 @@ TYPE_NAMES = {
     "beer_garden": "beer garden",
 }
 VENUE_TYPES = tuple(TYPE_NAMES)
+
+#: Chains whose pubs are known to be cheap, by the domain of the website
+#: Google lists for the venue. Every domain here was seen on real venues in
+#: live Places results on 20 Nov 2026, never guessed:
+#:   jdwetherspoon.com     most Wetherspoon pubs ("/pubs/all-pubs/england/...")
+#:   jdwetherspoon.co.uk   the older address, still on some (The Willow Walk)
+#:   samuelsmithsbrewery.co.uk   some Samuel Smith's pubs (Horse & Groom);
+#:                         most have a one-off domain of their own instead,
+#:                         and are left to Google's price level
+#:   simmonsbar.co.uk      every Simmons bar
+CHEAP_CHAINS = {
+    "jdwetherspoon.com": "Wetherspoon",
+    "jdwetherspoon.co.uk": "Wetherspoon",
+    "samuelsmithsbrewery.co.uk": "Samuel Smith's",
+    "simmonsbar.co.uk": "Simmons",
+}
+CHEAP_PRICE_LEVEL = "PRICE_LEVEL_INEXPENSIVE"
 
 #: Average walking speed used to turn "within 10 minutes' walk" into metres.
 METRES_PER_WALK_MINUTE = 80
@@ -316,6 +334,33 @@ def close_label(status: str, close: datetime | None, now: datetime) -> str:
     return label
 
 
+# ── Likely cheap ─────────────────────────────────────────────────────────────
+
+
+def cheap_chain(website: str | None) -> str | None:
+    """The cheap chain a venue's website belongs to, or None.
+
+    Matched on the host name, not anywhere in the address, so a page that
+    merely mentions jdwetherspoon.com in its query string is not a Spoons.
+    """
+    try:
+        host = (urlsplit(website or "").hostname or "").lower()
+    except ValueError:
+        return None
+    for domain, chain in CHEAP_CHAINS.items():
+        if host == domain or host.endswith("." + domain):
+            return chain
+    return None
+
+
+def likely_cheap(place: dict) -> tuple[bool, str | None]:
+    """(likely cheap?, chain name if that is why). Never a price: a guess."""
+    chain = cheap_chain(place.get("websiteUri"))
+    if chain:
+        return True, chain
+    return place.get("priceLevel") == CHEAP_PRICE_LEVEL, None
+
+
 # ── Ranking ──────────────────────────────────────────────────────────────────
 
 
@@ -329,7 +374,7 @@ def rank(places: list, now: datetime, centre: tuple[float, float]) -> dict:
 
     Returns {"open": [entries...], "unknown": [names...], "closed": count},
     where each entry is a dict with name, kind, distance_m, point (lat, lon),
-    status, closes_at.
+    status, closes_at, likely_cheap, chain.
     Places that have shut for good, or for now, are dropped altogether.
     """
     open_places, unknown, closed = [], [], 0
@@ -354,6 +399,7 @@ def rank(places: list, now: datetime, centre: tuple[float, float]) -> dict:
         if "latitude" in loc and "longitude" in loc:
             point = (loc["latitude"], loc["longitude"])
             metres = distance_m(centre[0], centre[1], point[0], point[1])
+        cheap, chain = likely_cheap(place)
         open_places.append({
             "name": name,
             "kind": kind,
@@ -361,6 +407,8 @@ def rank(places: list, now: datetime, centre: tuple[float, float]) -> dict:
             "point": point,
             "status": status,
             "closes_at": close,
+            "likely_cheap": cheap,
+            "chain": chain,
         })
 
     # Latest close first (full datetimes, so 1am Saturday beats 11pm Friday),
@@ -381,7 +429,16 @@ def distance_label(metres: float | None) -> str:
     return f"{round(metres / 10) * 10:.0f} m, about {minutes} min walk"
 
 
+def cheap_label(entry: dict) -> str:
+    """"likely cheap (Wetherspoon)", "likely cheap" or "". Never a price."""
+    if not entry.get("likely_cheap"):
+        return ""
+    return f"likely cheap ({entry['chain']})" if entry.get("chain") else "likely cheap"
+
+
 def describe(entry: dict, now: datetime) -> str:
     """One line per venue, the form the agent reads."""
+    cheap = cheap_label(entry)
     return (f"{entry['name']} ({entry['kind']}, {distance_label(entry['distance_m'])}): "
-            f"{close_label(entry['status'], entry['closes_at'], now)}")
+            f"{close_label(entry['status'], entry['closes_at'], now)}"
+            + (f", {cheap}" if cheap else ""))
