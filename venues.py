@@ -13,6 +13,7 @@ those are compared.
 from __future__ import annotations
 
 import math
+import re
 from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from zoneinfo import ZoneInfo
 
@@ -223,6 +224,67 @@ def next_close(place: dict, now: datetime) -> tuple[str, datetime | None]:
     return CLOSED, None
 
 
+_CLOCK = re.compile(r"^(\d{1,2})(?:[:.](\d{2}))?\s*(am|pm|a\.m\.?|p\.m\.?)?$")
+_WORDS = {"midnight": time(0, 0), "12 midnight": time(0, 0),
+          "midday": time(12, 0), "noon": time(12, 0), "12 noon": time(12, 0)}
+
+
+def parse_clock(text: str) -> time | None:
+    """"2am", "1:30am", "1.30 am", "02:00", "23:30", "midnight" -> a time of day.
+
+    A bare hour with no am/pm is read the way people mean it of a night out:
+    "till 2" is 2am, "till 11" is 11pm, "till 12" is midnight. Written with a
+    leading zero or past 12 ("02:00", "23:00") it is a 24-hour clock.
+    Anything else -> None.
+    """
+    text = " ".join(text.lower().replace("o'clock", "").split())
+    if text in _WORDS:
+        return _WORDS[text]
+    match = _CLOCK.match(text)
+    if not match:
+        return None
+    digits, minute_text, suffix = match.groups()
+    hour, minute = int(digits), int(minute_text or 0)
+    if minute > 59:
+        return None
+    if suffix:
+        if not 1 <= hour <= 12:
+            return None
+        hour %= 12
+        if suffix.startswith("p"):
+            hour += 12
+    elif hour > 23:
+        return None
+    elif hour <= 12 and not digits.startswith("0"):
+        if hour == 12:
+            hour = 0                    # "till 12" on a night out is midnight
+        elif hour >= 7:
+            hour += 12                  # "till 11" is 11pm; "till 2" is 2am
+    return time(hour, minute)
+
+
+def tonight_at(clock: time, now: datetime, zone: tzinfo = LONDON) -> datetime:
+    """The moment `clock` refers to, said at `now`: past midnight aware.
+
+    The next time the clock shows it, unless it showed it in the last six
+    hours. So at 11pm on Friday, "2am" is Saturday 2am and "11pm" is the 11pm
+    just gone (every place open now is open after it); at 10am, "midnight" is
+    tonight's.
+    """
+    local_now = now.astimezone(zone)
+    earliest = local_now - timedelta(hours=6)
+    moment = datetime.combine(earliest.date(), clock, tzinfo=zone)
+    if moment < earliest:
+        moment += timedelta(days=1)
+    return moment
+
+
+def open_until(entries: list, moment: datetime) -> list:
+    """The entries still open at `moment`: closing then or later, or 24 hours."""
+    return [v for v in entries
+            if v["status"] == OPEN_24H or v["closes_at"] is None or v["closes_at"] >= moment]
+
+
 def clock_label(moment: datetime) -> str:
     """`01:00` -> "1am", `00:30` -> "12:30am", `00:00` -> "midnight".
 
@@ -262,7 +324,8 @@ def place_name(place: dict) -> str:
 
 
 def rank(places: list, now: datetime, centre: tuple[float, float]) -> dict:
-    """Sort the open places by how late they stay open, latest first.
+    """Sort the open places by how late they stay open, latest first,
+    with open-24-hours places after every place that has a closing time.
 
     Returns {"open": [entries...], "unknown": [names...], "closed": count},
     where each entry is a dict with name, kind, distance_m, point (lat, lon),
@@ -300,10 +363,11 @@ def rank(places: list, now: datetime, centre: tuple[float, float]) -> dict:
             "closes_at": close,
         })
 
-    # Open-24-hours first, then latest close first (full datetimes, so 1am
-    # Saturday beats 11pm Friday), then nearest first to break a tie.
+    # Latest close first (full datetimes, so 1am Saturday beats 11pm Friday),
+    # nearest first to break a tie, and open-24-hours places last: they are
+    # mostly hotel lounges, and "open till 3am" is the answer people want.
     open_places.sort(key=lambda v: (
-        v["status"] != OPEN_24H,
+        v["status"] == OPEN_24H,
         -v["closes_at"].timestamp() if v["closes_at"] else 0.0,
         v["distance_m"] if v["distance_m"] is not None else math.inf,
     ))

@@ -104,6 +104,11 @@ class PlaceNotFound(AgentAppError):
     retryable = False
 
 
+class BadTime(AgentAppError):
+    user_message = "I could not read that as a time."
+    retryable = False
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """A redirect is an error: the key never goes anywhere but Google."""
 
@@ -182,6 +187,15 @@ class App:
         if not location:
             raise NoLocation("no location in the message")
         destination = " ".join((call.inputs.get("destination") or "").split())
+        until_text = " ".join((call.inputs.get("open_until") or "").split())
+        until_clock = None
+        if until_text:
+            until_clock = venues.parse_clock(until_text)
+            if until_clock is None:
+                error = BadTime(f"open_until not a clock time: {until_text!r}")
+                error.user_message = (f"I could not read \"{until_text}\" as a closing time; "
+                                      "try something like 2am, 1:30am or midnight.")
+                raise error
 
         key = os.environ.get("GOOGLE_MAPS_API_KEY", "")
         if not key:
@@ -212,7 +226,12 @@ class App:
 
         now = call.context.now
         ranked = venues.rank(places, now, (lat, lon))
-        top = ranked["open"][:MAX_VENUES]
+        late_enough = ranked["open"]
+        until = None
+        if until_clock is not None:
+            until = venues.tonight_at(until_clock, now)
+            late_enough = venues.open_until(ranked["open"], until)
+        top = late_enough[:MAX_VENUES]
 
         data = {
             "location_used": location_used,
@@ -222,6 +241,9 @@ class App:
             "closed_count": ranked["closed"],
             "unknown_hours": ranked["unknown"][:MAX_VENUES],
         }
+        if until is not None:
+            data["open_until_used"] = f"{venues.clock_label(until)} {until.strftime('%A')}"
+            data["closing_too_early"] = len(ranked["open"]) - len(late_enough)
         if top:
             data["latest_venue"] = top[0]["name"]
             data["latest_closing"] = venues.close_label(
@@ -234,6 +256,9 @@ class App:
         if destination:
             first_route = self._routes_home(top, destination, key, now, started, data)
 
+        if until is not None and not top:
+            return Result(data=data, narrative=self._too_early(
+                ranked["open"], location_used, walk, until, now))
         return Result(data=data, narrative=self._sentence(
             top, location_used, walk, now, first_route, data.get("destination_used")))
 
@@ -364,6 +389,18 @@ class App:
         return journey, None
 
     # ── The sentence ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _too_early(open_now: list, location_used: str, walk: int, until: datetime,
+                   now: datetime) -> str:
+        """Nothing stays open till the time asked for: say so, and what is latest."""
+        text = (f"Nothing within about {walk} minutes' walk of {location_used} stays open "
+                f"till {venues.clock_label(until)}, as far as Google's opening hours say.")
+        if open_now:
+            latest = open_now[0]
+            text += (f" The latest is {latest['name']}, "
+                     f"{venues.close_label(latest['status'], latest['closes_at'], now)}.")
+        return text
 
     @staticmethod
     def _sentence(top: list, location_used: str, walk: int, now,

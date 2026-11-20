@@ -22,6 +22,7 @@ from app import (
     NEARBY_SEARCH_URL,
     TEXT_SEARCH_URL,
     App,
+    BadTime,
     GoogleRefused,
     KeyMissing,
     NoLocation,
@@ -234,11 +235,22 @@ def test_midnight_split_into_two_periods_is_one_late_night():
     assert data["latest_closing"] == "open till 2am"
 
 
-def test_open_24_hours_ranks_first():
-    allday = place("Billionaire Lounge", {"periods": [{"open": {"day": 0, "hour": 0, "minute": 0}}]},
-                   kind="lounge_bar")
-    data = run(FakeGoogle([CLUB_3AM, allday])).data
-    assert data["venues"][0].startswith("Billionaire Lounge")
+ALLDAY = {"periods": [{"open": {"day": 0, "hour": 0, "minute": 0}}]}
+
+
+def test_open_24_hours_ranks_after_places_that_close():
+    allday = place("Billionaire Lounge", ALLDAY, kind="lounge_bar")
+    data = run(FakeGoogle([allday, PUB_MIDNIGHT, CLUB_3AM])).data
+    names = [line.split(" (")[0] for line in data["venues"]]
+    assert names == ["Luna Kensington", "Zetland Arms", "Billionaire Lounge"]
+    assert data["latest_venue"] == "Luna Kensington"
+    assert data["venues"][-1].endswith(": open 24 hours")
+
+
+def test_open_24_hours_alone_is_still_the_answer():
+    allday = place("Billionaire Lounge", ALLDAY, kind="lounge_bar")
+    data = run(FakeGoogle([allday])).data
+    assert data["latest_venue"] == "Billionaire Lounge"
     assert data["latest_closing"] == "open 24 hours"
     assert "latest_closes_at" not in data
 
@@ -539,3 +551,114 @@ def test_leg_wording():
     assert routes._leg_words(leg("bus", 8, "N205")) == "N205 bus"
     assert routes._leg_words(leg("elizabeth-line", 9, "Elizabeth line")) == "Elizabeth line"
     assert routes._leg_words(leg("walking", 0)) == ""
+
+
+def test_routes_go_to_places_that_close_before_24_hour_ones():
+    closers = [place(f"Pub {n}", every_day("09:00", "00:00", overnight=True)) for n in range(5)]
+    alldays = [place(f"Hotel Bar {n}", ALLDAY, kind="bar") for n in range(2)]
+    tfl = FakeTfl()
+    data = run(FakeGoogle(alldays + closers), HOME_TRIP, tfl=tfl).data
+    assert len(tfl.urls) == 5
+    assert all(r.startswith("Pub ") for r in data["routes_home"])
+    assert data["venues"][-1].startswith("Hotel Bar ")
+
+
+def test_24_hour_places_get_routes_when_fewer_than_five_close():
+    alldays = [place(f"Hotel Bar {n}", ALLDAY, kind="bar") for n in range(4)]
+    tfl = FakeTfl()
+    data = run(FakeGoogle(alldays + [CLUB_3AM, PUB_MIDNIGHT]), HOME_TRIP, tfl=tfl).data
+    assert [r.split(":")[0] for r in data["routes_home"]] == [
+        "Luna Kensington", "Zetland Arms", "Hotel Bar 0", "Hotel Bar 1", "Hotel Bar 2"]
+    assert "leave now" in data["routes_home"][2]
+
+
+# ── open_until ───────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("text, hour, minute", [
+    ("2am", 2, 0), ("2 am", 2, 0), ("1:30am", 1, 30), ("1.30 a.m.", 1, 30),
+    ("midnight", 0, 0), ("12am", 0, 0), ("12pm", 12, 0), ("11pm", 23, 0),
+    ("02:00", 2, 0), ("23:30", 23, 30), ("0:30", 0, 30),
+    ("2", 2, 0), ("11", 23, 0), ("12", 0, 0), ("3 o'clock", 3, 0),
+])
+def test_clock_times_people_type(text, hour, minute):
+    parsed = venues.parse_clock(text)
+    assert (parsed.hour, parsed.minute) == (hour, minute)
+
+
+@pytest.mark.parametrize("text", ["late", "13am", "2:75", "25:00", "soon", "0am"])
+def test_things_that_are_not_clock_times(text):
+    assert venues.parse_clock(text) is None
+
+
+@pytest.mark.parametrize("now, clock, expected", [
+    (FRI_2300, "2am", "2026-11-21T02:00:00+00:00"),          # tonight, past midnight
+    (FRI_2300, "midnight", "2026-11-21T00:00:00+00:00"),
+    (FRI_2300, "11pm", "2026-11-20T23:00:00+00:00"),         # just now: not tomorrow
+    (FRI_2300, "10pm", "2026-11-20T22:00:00+00:00"),
+    (SAT_0130, "3am", "2026-11-21T03:00:00+00:00"),
+    (SAT_0130, "midnight", "2026-11-21T00:00:00+00:00"),     # the one just gone
+    (datetime(2026, 11, 20, 10, 0, tzinfo=timezone.utc), "midnight",
+     "2026-11-21T00:00:00+00:00"),                           # tonight's, said in the morning
+])
+def test_open_until_means_tonight(now, clock, expected):
+    assert venues.tonight_at(venues.parse_clock(clock), now).isoformat() == expected
+
+
+def test_open_until_keeps_only_places_open_that_late():
+    allday = place("Glamis Bar", ALLDAY, kind="bar")
+    data = run(FakeGoogle([PUB_2300, PUB_MIDNIGHT, CLUB_3AM, allday]),
+               {"location": "South Kensington", "open_until": "2am"}).data
+    names = [line.split(" (")[0] for line in data["venues"]]
+    assert names == ["Luna Kensington", "Glamis Bar"]
+    assert data["open_until_used"] == "2am Saturday"
+    assert data["closing_too_early"] == 1           # Zetland Arms; the 11pm pub is shut
+    assert data["open_count"] == 3
+
+
+def test_open_until_counts_a_close_exactly_at_that_time():
+    data = run(FakeGoogle([PUB_MIDNIGHT]),
+               {"location": "South Kensington", "open_until": "midnight"}).data
+    assert data["venues"][0].startswith("Zetland Arms")
+    assert data["closing_too_early"] == 0
+
+
+def test_open_until_in_summer_is_london_time():
+    summer = datetime(2026, 6, 19, 22, 0, tzinfo=timezone.utc)     # 23:00 BST
+    data = run(FakeGoogle([place("Summer Bar", every_day("12:00", "02:00", overnight=True),
+                                 utcOffsetMinutes=60, kind="bar")]),
+               {"location": "South Kensington", "open_until": "2am"}, now=summer).data
+    assert data["open_until_used"] == "2am Saturday"
+    assert data["venues"][0].startswith("Summer Bar")
+
+
+def test_nothing_open_that_late_names_the_latest():
+    result = run(FakeGoogle([PUB_MIDNIGHT, CLUB_3AM]),
+                 {"location": "South Kensington", "open_until": "4am"})
+    assert result.data["venues"] == []
+    assert result.data["closing_too_early"] == 2
+    assert "latest_venue" not in result.data
+    assert "stays open till 4am" in result.narrative
+    assert "The latest is Luna Kensington, open till 3am." in result.narrative
+
+
+def test_open_until_routes_only_the_late_ones():
+    tfl = FakeTfl()
+    data = run(FakeGoogle([PUB_MIDNIGHT, CLUB_3AM]),
+               dict(HOME_TRIP, open_until="1am"), tfl=tfl).data
+    assert len(tfl.urls) == 1
+    assert data["routes_home"][0].startswith("Luna Kensington")
+
+
+def test_an_unreadable_time_says_what_to_type():
+    with pytest.raises(BadTime) as caught:
+        run(FakeGoogle([CLUB_3AM]), {"location": "Soho", "open_until": "whenever"},
+            explicit=True)
+    assert caught.value.user_message == (
+        'I could not read "whenever" as a closing time; '
+        "try something like 2am, 1:30am or midnight.")
+
+
+def test_no_open_until_means_no_filter_fields():
+    data = run(FakeGoogle([CLUB_3AM])).data
+    assert "open_until_used" not in data and "closing_too_early" not in data
